@@ -45,6 +45,37 @@ const TETROMINOES = {
 
 const TETROMINO_TYPES = Object.keys(TETROMINOES);
 
+// T-spin detection patterns
+const T_SPIN_PATTERNS = {
+  // Check corners around T piece center
+  checkCorners: (board, centerX, centerY) => {
+    const corners = [
+      { x: centerX - 1, y: centerY - 1 }, // Top-left
+      { x: centerX + 1, y: centerY - 1 }, // Top-right
+      { x: centerX - 1, y: centerY + 1 }, // Bottom-left
+      { x: centerX + 1, y: centerY + 1 }  // Bottom-right
+    ];
+    
+    let filledCorners = 0;
+    let frontCorners = 0; // Top corners
+    let backCorners = 0;  // Bottom corners
+    
+    corners.forEach((corner, index) => {
+      const isFilled = corner.x < 0 || corner.x >= BOARD_WIDTH || 
+                      corner.y < 0 || corner.y >= BOARD_HEIGHT ||
+                      (corner.y >= 0 && board[corner.y][corner.x] !== 0);
+      
+      if (isFilled) {
+        filledCorners++;
+        if (index < 2) frontCorners++;
+        else backCorners++;
+      }
+    });
+    
+    return { filledCorners, frontCorners, backCorners };
+  }
+};
+
 // SRS Wall Kick Data - Modern Tetris rotation system
 const SRS_WALL_KICKS = {
   // Standard pieces (J, L, S, T, Z)
@@ -102,6 +133,7 @@ const TetroMaster = () => {
   const [currentPiece, setCurrentPiece] = useState(null);
   const [nextPiece, setNextPiece] = useState(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [rotation, setRotation] = useState(0); // Track rotation state for T-spins
   const [score, setScore] = useState(0);
   const [level, setLevel] = useState(1);
   const [lines, setLines] = useState(0);
@@ -115,12 +147,48 @@ const TetroMaster = () => {
   const [showGhost, setShowGhost] = useState(true);
   const [gameMode, setGameMode] = useState('modern'); // 'classic' or 'modern'
   const [gameOverAnimation, setGameOverAnimation] = useState(false);
+  
+  // 7-bag randomization system
+  const [pieceBag, setPieceBag] = useState([]);
+  const [bagIndex, setBagIndex] = useState(0);
+  
+  // Advanced scoring states
+  const [combo, setCombo] = useState(0);
+  const [lastClearWasTSpin, setLastClearWasTSpin] = useState(false);
+  const [tSpinType, setTSpinType] = useState(''); // 'single', 'double', 'triple'
+  const [scorePopups, setScorePopups] = useState([]);
+  const [backToBack, setBackToBack] = useState(false);
+  
+  // Create a new 7-bag (contains all 7 pieces in random order)
+  const createNewBag = () => {
+    const bag = [...TETROMINO_TYPES];
+    // Fisher-Yates shuffle
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+    return bag;
+  };
 
-  const createRandomPiece = () => {
-    const type = TETROMINO_TYPES[Math.floor(Math.random() * TETROMINO_TYPES.length)];
+  // Get next piece from 7-bag system
+  const getNextPieceFromBag = () => {
+    if (pieceBag.length === 0 || bagIndex >= pieceBag.length) {
+      const newBag = createNewBag();
+      setPieceBag(newBag);
+      setBagIndex(0);
+      const pieceType = newBag[0];
+      setBagIndex(1);
+      return {
+        shape: TETROMINOES[pieceType],
+        type: pieceType
+      };
+    }
+    
+    const pieceType = pieceBag[bagIndex];
+    setBagIndex(bagIndex + 1);
     return {
-      shape: TETROMINOES[type],
-      type: type
+      shape: TETROMINOES[pieceType],
+      type: pieceType
     };
   };
 
@@ -131,11 +199,36 @@ const TetroMaster = () => {
     return { ...piece, shape: rotated };
   };
 
+  const detectTSpin = (piece, pos, boardBeforePlacement, wasKicked) => {
+    if (piece.type !== 'T' || gameMode === 'classic') return false;
+    
+    // Must have used wall kicks to be a T-spin
+    if (!wasKicked) return false;
+    
+    // Find the T piece center (the stem of the T)
+    const centerX = pos.x + 1; // T piece center is always at x+1
+    const centerY = pos.y + 1; // T piece center is always at y+1
+    
+    const { filledCorners, frontCorners, backCorners } = T_SPIN_PATTERNS.checkCorners(
+      boardBeforePlacement, centerX, centerY
+    );
+    
+    // T-spin requires at least 3 corners to be filled
+    return filledCorners >= 3;
+  };
+
   const tryRotateWithKicks = (piece, pos, clockwise = true) => {
+    const oldRotation = rotation;
+    const newRotation = (rotation + (clockwise ? 1 : -1) + 4) % 4;
+    
     if (gameMode === 'classic') {
       // Classic mode - simple rotation without kicks
       const rotated = rotatePiece(piece);
-      return isValidMove(board, rotated, pos) ? { piece: rotated, position: pos } : null;
+      if (isValidMove(board, rotated, pos)) {
+        setRotation(newRotation);
+        return { piece: rotated, position: pos, wasKicked: false };
+      }
+      return null;
     }
 
     // Modern mode - SRS with wall kicks
@@ -143,24 +236,26 @@ const TetroMaster = () => {
     
     // First try basic rotation
     if (isValidMove(board, rotated, pos)) {
-      return { piece: rotated, position: pos };
+      setRotation(newRotation);
+      return { piece: rotated, position: pos, wasKicked: false };
     }
 
     // If basic rotation fails, try wall kicks
     const pieceType = piece.type;
     const kickData = (pieceType === 'I') ? SRS_WALL_KICKS.I : SRS_WALL_KICKS.JLSTZ;
     
-    // Determine rotation states (simplified - we'll use a basic state system)
-    // For this implementation, we'll try the most common kick patterns
-    const commonKicks = [
+    // Use proper kick data based on rotation
+    const rotationKey = `${oldRotation}->${newRotation}`;
+    const kicks = kickData[rotationKey] || [
       [-1, 0], [1, 0], [0, -1], [-1, -1], [1, -1], 
       [-2, 0], [2, 0], [0, -2], [-1, 1], [1, 1]
     ];
     
-    for (const [dx, dy] of commonKicks) {
+    for (const [dx, dy] of kicks) {
       const testPos = { x: pos.x + dx, y: pos.y + dy };
       if (isValidMove(board, rotated, testPos)) {
-        return { piece: rotated, position: testPos };
+        setRotation(newRotation);
+        return { piece: rotated, position: testPos, wasKicked: true };
       }
     }
     
@@ -202,6 +297,23 @@ const TetroMaster = () => {
     return newBoard;
   };
 
+  const addScorePopup = (text, value, color = 'text-yellow-400') => {
+    const popup = {
+      id: Date.now() + Math.random(),
+      text,
+      value,
+      color,
+      x: Math.random() * 200 + 50,
+      y: Math.random() * 100 + 50
+    };
+    setScorePopups(prev => [...prev, popup]);
+    
+    // Remove popup after animation
+    setTimeout(() => {
+      setScorePopups(prev => prev.filter(p => p.id !== popup.id));
+    }, 2000);
+  };
+
   const clearLines = (board) => {
     const linesToClear = [];
     
@@ -241,9 +353,79 @@ const TetroMaster = () => {
     return { board, linesCleared: linesToClear.length };
   };
 
-  const calculateScore = (linesCleared, level) => {
-    const baseScores = [0, 100, 300, 500, 800]; // Single, Double, Triple, Tetris
-    return baseScores[linesCleared] * level;
+  const updateLevel = useCallback((newLines) => {
+    const newLevel = Math.floor(newLines / 10) + 1;
+    if (newLevel > level) {
+      setLevel(newLevel);
+      // More aggressive speed curve for better gameplay feel
+      const newFallTime = Math.max(50, INITIAL_FALL_TIME - (newLevel - 1) * 75);
+      setFallTime(newFallTime);
+      
+      // Show level up notification
+      addScorePopup(`LEVEL ${newLevel}`, 0, 'text-green-400');
+      
+      console.log(`Level up! New level: ${newLevel}, Fall time: ${newFallTime}ms`);
+      return newLevel;
+    }
+    return level;
+  }, [level]);
+
+  const calculateAdvancedScore = (linesCleared, level, isTSpin = false, tSpinType = '', comboCount = 0, isBackToBack = false) => {
+    if (linesCleared === 0) return 0;
+    
+    let baseScore = 0;
+    let scoreText = '';
+    let color = 'text-yellow-400';
+    
+    if (isTSpin) {
+      // T-spin scoring
+      const tSpinScores = {
+        single: 800,
+        double: 1200,
+        triple: 1600
+      };
+      baseScore = tSpinScores[tSpinType] || 400;
+      scoreText = `T-SPIN ${tSpinType.toUpperCase()}`;
+      color = 'text-purple-400';
+    } else {
+      // Regular line clear scoring
+      const baseScores = [0, 100, 300, 500, 800]; // Single, Double, Triple, Tetris
+      baseScore = baseScores[linesCleared];
+      
+      if (linesCleared === 4) {
+        scoreText = 'TETRIS';
+        color = 'text-blue-400';
+      } else if (linesCleared === 3) {
+        scoreText = 'TRIPLE';
+        color = 'text-green-400';
+      } else if (linesCleared === 2) {
+        scoreText = 'DOUBLE';
+        color = 'text-orange-400';
+      } else {
+        scoreText = 'SINGLE';
+      }
+    }
+    
+    // Back-to-back bonus (50% more points)
+    if (isBackToBack && (linesCleared === 4 || isTSpin)) {
+      baseScore = Math.floor(baseScore * 1.5);
+      scoreText = 'B2B ' + scoreText;
+      color = 'text-red-400';
+    }
+    
+    // Combo bonus
+    let comboBonus = 0;
+    if (comboCount > 0) {
+      comboBonus = 50 * comboCount * level;
+      if (comboCount > 1) {
+        addScorePopup(`${comboCount}× COMBO`, comboBonus, 'text-cyan-400');
+      }
+    }
+    
+    const totalScore = (baseScore * level) + comboBonus;
+    addScorePopup(scoreText, baseScore * level, color);
+    
+    return totalScore;
   };
 
   const spawnNewPiece = useCallback(() => {
@@ -265,8 +447,17 @@ const TetroMaster = () => {
     
     setCurrentPiece(newPiece);
     setPosition({ x: startX, y: startY });
-    setNextPiece(createRandomPiece());
-  }, [board, nextPiece]);
+    setRotation(0);
+    setNextPiece(gameMode === 'modern' ? getNextPieceFromBag() : createRandomPiece());
+  }, [board, nextPiece, gameMode, pieceBag, bagIndex]);
+
+  const createRandomPiece = () => {
+    const type = TETROMINO_TYPES[Math.floor(Math.random() * TETROMINO_TYPES.length)];
+    return {
+      shape: TETROMINOES[type],
+      type: type
+    };
+  };
 
   const drop = useCallback(() => {
     if (!currentPiece || gameOver || paused) return;
@@ -281,10 +472,30 @@ const TetroMaster = () => {
       
       if (linesCleared === 0) {
         setBoard(newBoard);
+        setCombo(0); // Reset combo on no line clear
+        setBackToBack(false);
         spawnNewPiece();
       } else {
-        // Update score and level immediately
-        setScore(prev => prev + calculateScore(linesCleared, level));
+        // Check for T-spin
+        const isTSpin = detectTSpin(currentPiece, position, board, lastClearWasTSpin);
+        const tSpinTypes = ['', 'single', 'double', 'triple'];
+        const currentTSpinType = isTSpin ? tSpinTypes[linesCleared] : '';
+        
+        // Determine if this is back-to-back
+        const isBackToBack = backToBack && (linesCleared === 4 || isTSpin);
+        
+        // Calculate advanced score
+        const scoreGained = calculateAdvancedScore(
+          linesCleared, 
+          level, 
+          isTSpin, 
+          currentTSpinType, 
+          combo, 
+          isBackToBack
+        );
+        
+        // Update game state
+        setScore(prev => prev + scoreGained);
         setLines(prev => {
           const newLines = prev + linesCleared;
           const newLevel = Math.floor(newLines / 10) + 1;
@@ -295,13 +506,19 @@ const TetroMaster = () => {
           return newLines;
         });
         
+        // Update combo and back-to-back states
+        setCombo(prev => prev + 1);
+        setBackToBack(linesCleared === 4 || isTSpin);
+        setLastClearWasTSpin(isTSpin);
+        setTSpinType(currentTSpinType);
+        
         // Spawn new piece after line clear animation
         setTimeout(() => {
           spawnNewPiece();
         }, 300);
       }
     }
-  }, [board, currentPiece, position, gameOver, paused, level, spawnNewPiece]);
+  }, [board, currentPiece, position, gameOver, paused, level, spawnNewPiece, combo, backToBack, lastClearWasTSpin]);
 
   const move = (dir) => {
     if (!currentPiece || gameOver || paused) return;
@@ -319,6 +536,7 @@ const TetroMaster = () => {
     if (result) {
       setCurrentPiece(result.piece);
       setPosition(result.position);
+      setLastClearWasTSpin(result.wasKicked); // Track if rotation used kicks
     }
   };
 
@@ -343,18 +561,40 @@ const TetroMaster = () => {
         
         if (linesCleared === 0) {
           setBoard(newBoard);
+          setCombo(0);
+          setBackToBack(false);
           spawnNewPiece();
         } else {
-          setScore(prev => prev + calculateScore(linesCleared, level));
+          // Check for T-spin
+          const isTSpin = detectTSpin(currentPiece, { x: position.x, y: newY }, board, lastClearWasTSpin);
+          const tSpinTypes = ['', 'single', 'double', 'triple'];
+          const currentTSpinType = isTSpin ? tSpinTypes[linesCleared] : '';
+          
+          // Determine if this is back-to-back
+          const isBackToBack = backToBack && (linesCleared === 4 || isTSpin);
+          
+          // Calculate advanced score
+          const scoreGained = calculateAdvancedScore(
+            linesCleared, 
+            level, 
+            isTSpin, 
+            currentTSpinType, 
+            combo, 
+            isBackToBack
+          );
+          
+          setScore(prev => prev + scoreGained);
           setLines(prev => {
             const newLines = prev + linesCleared;
-            const newLevel = Math.floor(newLines / 10) + 1;
-            if (newLevel > level) {
-              setLevel(newLevel);
-              setFallTime(Math.max(50, INITIAL_FALL_TIME - (newLevel - 1) * 50));
-            }
+            updateLevel(newLines);
             return newLines;
           });
+          
+          // Update combo and back-to-back states
+          setCombo(prev => prev + 1);
+          setBackToBack(linesCleared === 4 || isTSpin);
+          setLastClearWasTSpin(isTSpin);
+          setTSpinType(currentTSpinType);
           
           setTimeout(() => {
             spawnNewPiece();
@@ -392,12 +632,28 @@ const TetroMaster = () => {
   };
 
   const startGame = () => {
-    const firstPiece = createRandomPiece();
-    const secondPiece = createRandomPiece();
+    // Initialize 7-bag system for modern mode
+    if (gameMode === 'modern') {
+      const firstBag = createNewBag();
+      setPieceBag(firstBag);
+      setBagIndex(2); // We'll use first two pieces immediately
+      
+      const firstPiece = { shape: TETROMINOES[firstBag[0]], type: firstBag[0] };
+      const secondPiece = { shape: TETROMINOES[firstBag[1]], type: firstBag[1] };
+      
+      setCurrentPiece(firstPiece);
+      setNextPiece(secondPiece);
+    } else {
+      // Classic mode uses pure random
+      const firstPiece = createRandomPiece();
+      const secondPiece = createRandomPiece();
+      
+      setCurrentPiece(firstPiece);
+      setNextPiece(secondPiece);
+    }
     
-    setCurrentPiece(firstPiece);
-    setNextPiece(secondPiece);
     setPosition({ x: Math.floor(BOARD_WIDTH / 2) - 1, y: 0 });
+    setRotation(0);
     setGameStarted(true);
     setGameOver(false);
     setGameOverAnimation(false);
@@ -405,6 +661,11 @@ const TetroMaster = () => {
     setScore(0);
     setLevel(1);
     setLines(0);
+    setCombo(0);
+    setBackToBack(false);
+    setLastClearWasTSpin(false);
+    setTSpinType('');
+    setScorePopups([]);
     setFallTime(INITIAL_FALL_TIME);
     setBoard(Array(BOARD_HEIGHT).fill().map(() => Array(BOARD_WIDTH).fill(0)));
     setClearedLines([]);
@@ -420,6 +681,14 @@ const TetroMaster = () => {
     setClearedLines([]);
     setShowTetris(false);
     setKeysPressed(new Set());
+    setCombo(0);
+    setBackToBack(false);
+    setLastClearWasTSpin(false);
+    setTSpinType('');
+    setScorePopups([]);
+    setRotation(0);
+    setPieceBag([]);
+    setBagIndex(0);
   };
 
   useEffect(() => {
@@ -611,13 +880,38 @@ const TetroMaster = () => {
     );
   };
 
+  const renderScorePopups = () => {
+    return scorePopups.map(popup => (
+      <div
+        key={popup.id}
+        className={`absolute font-bold text-lg font-mono ${popup.color} animate-ping pointer-events-none z-30`}
+        style={{
+          left: popup.x,
+          top: popup.y,
+          animation: 'scorePopup 2s ease-out forwards'
+        }}
+      >
+        {popup.text}
+        {popup.value > 0 && <div className="text-sm">+{popup.value}</div>}
+      </div>
+    ));
+  };
+
   return (
     <div className="flex justify-center items-center min-h-screen bg-gray-900 p-4">
+      <style jsx>{`
+        @keyframes scorePopup {
+          0% { opacity: 1; transform: translateY(0); }
+          100% { opacity: 0; transform: translateY(-50px); }
+        }
+      `}</style>
+      
       <div className="flex gap-8 items-start">
         {/* Game Board */}
         <div className="bg-gray-800 p-4 rounded-lg shadow-2xl relative">
           <div className="border-4 border-gray-600 bg-gray-900 p-2 relative">
             {renderBoard()}
+            {renderScorePopups()}
             
             {/* Game over animation */}
             {gameOverAnimation && (
@@ -671,7 +965,7 @@ const TetroMaster = () => {
                 {gameMode === 'modern' ? 'MODERN' : 'CLASSIC'}
               </button>
               <div className="text-xs text-gray-400 mt-1">
-                {gameMode === 'modern' ? 'Wall kicks enabled' : 'Simple rotation'}
+                {gameMode === 'modern' ? '7-bag + T-spins' : 'Pure random'}
               </div>
             </div>
           )}
@@ -696,10 +990,32 @@ const TetroMaster = () => {
                   <span>Level:</span>
                   <span className="text-green-400">{level}</span>
                 </div>
-                <div className="flex justify-between mb-4">
+                <div className="flex justify-between mb-2">
                   <span>Lines:</span>
                   <span className="text-blue-400">{lines}</span>
                 </div>
+                <div className="flex justify-between mb-2">
+                  <span>Speed:</span>
+                  <span className="text-purple-400">{fallTime}ms</span>
+                </div>
+                {gameMode === 'modern' && (
+                  <>
+                    <div className="flex justify-between mb-2">
+                      <span>Combo:</span>
+                      <span className="text-cyan-400">{combo}×</span>
+                    </div>
+                    {backToBack && (
+                      <div className="text-center mb-2">
+                        <span className="text-red-400 font-bold animate-pulse">BACK-TO-BACK</span>
+                      </div>
+                    )}
+                    {tSpinType && (
+                      <div className="text-center mb-2">
+                        <span className="text-purple-400 font-bold">T-SPIN {tSpinType.toUpperCase()}</span>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
               
               <div className="mb-6">
